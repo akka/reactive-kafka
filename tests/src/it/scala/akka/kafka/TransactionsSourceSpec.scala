@@ -50,7 +50,7 @@ class TransactionsSourceSpec extends SpecBase
       val sinkTopic = createTopic(2, destinationPartitions, replication)
       val group = createGroupId(1)
 
-      val elements = 100 * 1000
+      val elements = 100 * 100000 // TODO: revert before merge
       val restartAfter = 10 * 1000
 
       val partitionSize = elements / sourcePartitions
@@ -59,7 +59,7 @@ class TransactionsSourceSpec extends SpecBase
           part => produce(sourceTopic, ((part * partitionSize) + 1) to (partitionSize * (part + 1)), part)
         )
 
-      Await.result(Future.sequence(producers), 1.minute)
+      Await.result(Future.sequence(producers), 10.minutes)
 
       val consumerSettings = consumerDefaults.withGroupId(group)
 
@@ -115,7 +115,7 @@ class TransactionsSourceSpec extends SpecBase
         .filter(_._2 != "no-more-elements")
         .runWith(Sink.seq)
 
-      val values = Await.result(consumer, 10.minutes)
+      val values = Await.result(consumer, 30.minutes)
 
       val expected = (1 to elements).map(_.toString)
 
