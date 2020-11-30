@@ -12,7 +12,7 @@ import akka.kafka.ConsumerMessage.{GroupTopicPartition, PartitionOffset, Partiti
 import akka.kafka.ProducerMessage._
 import akka.kafka.scaladsl.Producer
 import akka.kafka.tests.scaladsl.LogCapturing
-import akka.kafka.{ConsumerMessage, ProducerMessage, ProducerSettings}
+import akka.kafka.{ConsumerMessage, ProducerMessage, ProducerSettings, Repeated}
 import akka.stream.scaladsl.{Flow, Keep, Sink, Source}
 import akka.stream.testkit.scaladsl.StreamTestKit.assertAllStagesStopped
 import akka.stream.testkit.scaladsl.{TestSink, TestSource}
@@ -44,7 +44,8 @@ class ProducerSpec(_system: ActorSystem)
     with AnyFlatSpecLike
     with Matchers
     with BeforeAndAfterAll
-    with LogCapturing {
+    with LogCapturing
+    with Repeated {
 
   def this() =
     this(
@@ -557,7 +558,11 @@ class ProducerSpec(_system: ActorSystem)
 
     awaitAssert(client.verifyTxInitialized())
 
+    client.verifySend(atLeastOnce())
+
     source.sendError(new Exception())
+
+    awaitAssert(committedMarker.verifyTransactionAborted(txMsg.passThrough), 2.second)
 
     // Here we can not be sure that all messages from source delivered to producer
     // because of buffers in akka-stream and faster error pushing that ignores buffers
@@ -674,6 +679,9 @@ class ProducerMock[K, V](handler: ProducerMock.Handler[K, V])(implicit ec: Execu
 
 class CommittedMarkerMock {
   val mock = Mockito.mock(classOf[CommittedMarker])
+  val firstMessageReceived = Promise[Unit]()
+  val transactionAborted = Promise[Unit]()
+
   when(
     mock.committed(mockito.ArgumentMatchers.any[Map[TopicPartition, OffsetAndMetadata]])
   ).thenAnswer(new Answer[Future[Done]] {
@@ -681,12 +689,35 @@ class CommittedMarkerMock {
       Future.successful(Done)
   })
 
-  private[kafka] def verifyOffsets(pos: ConsumerMessage.PartitionOffsetCommittedMarker*): Future[Done] =
+  when(
+    mock.onFirstMessageReceived
+  ).thenAnswer(new Answer[Promise[Unit]] {
+    override def answer(invocation: InvocationOnMock): Promise[Unit] = firstMessageReceived
+  })
+
+  when(
+    mock.onTransactionAborted
+  ).thenAnswer(new Answer[Promise[Unit]] {
+    override def answer(invocation: InvocationOnMock): Promise[Unit] = transactionAborted
+  })
+
+  private[kafka] def verifyOffsets(pos: ConsumerMessage.PartitionOffsetCommittedMarker*): Unit = {
     Mockito
-      .verify(mock, Mockito.only())
+      .verify(mock)
       .committed(
         mockito.ArgumentMatchers.eq(
           pos.map(p => new TopicPartition(p.key.topic, p.key.partition) -> new OffsetAndMetadata(p.offset + 1)).toMap
         )
       )
+    Mockito.verify(mock).onFirstMessageReceived
+    Mockito.verifyNoMoreInteractions(mock)
+    assert(firstMessageReceived.isCompleted, "First message received promise is resolved")
+  }
+
+  private[kafka] def verifyTransactionAborted(pos: ConsumerMessage.PartitionOffsetCommittedMarker*): Unit = {
+    Mockito.verify(mock).onFirstMessageReceived
+    Mockito.verify(mock).onTransactionAborted
+    Mockito.verifyNoMoreInteractions(mock)
+    assert(transactionAborted.isCompleted, "Transaction aborted promise is resolved")
+  }
 }

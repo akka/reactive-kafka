@@ -27,7 +27,8 @@ import org.apache.kafka.common.{IsolationLevel, TopicPartition}
 
 import scala.collection.compat._
 import scala.concurrent.duration.FiniteDuration
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{Await, ExecutionContext, Future, Promise}
+import scala.util.{Success, Failure => TFailure}
 
 /** Internal API */
 @InternalApi
@@ -96,6 +97,12 @@ private[internal] abstract class TransactionalSourceLogic[K, V, Msg](shape: Sour
   override protected def logSource: Class[_] = classOf[TransactionalSourceLogic[_, _, _]]
 
   private val inFlightRecords = InFlightRecords.empty
+  private var firstMessageReceived = false
+
+  override def preStart(): Unit = {
+    super.preStart()
+    initSourceStageCallbacks(onFirstMessageReceivedCb, onTransactionAbortedCb)(materializer.executionContext)
+  }
 
   override def messageHandling = super.messageHandling.orElse(drainHandling).orElse {
     case (_, Revoked(tps)) =>
@@ -106,26 +113,20 @@ private[internal] abstract class TransactionalSourceLogic[K, V, Msg](shape: Sour
     super.shuttingDownReceive
       .orElse(drainHandling)
       .orElse {
-        case (_, Status.Failure(e)) =>
-          failStage(e)
-        case (_, Terminated(ref)) if ref == consumerActor =>
-          failStage(new ConsumerFailed())
+        case (_, Status.Failure(e)) => failStage(e)
+        case (_, Terminated(ref)) if ref == consumerActor => failStage(new ConsumerFailed())
       }
 
   private def drainHandling: PartialFunction[(ActorRef, Any), Unit] = {
     case (sender, Committed(offsets)) =>
       inFlightRecords.committed(offsets.view.mapValues(_.offset() - 1).toMap)
       sender.tell(Done, sourceActor.ref)
-    case (sender, CommittingFailure) => {
-      log.info("Committing failed, resetting in flight offsets")
-      inFlightRecords.reset()
-    }
     case (sender, Drain(partitions, ack, msg)) =>
-      if (inFlightRecords.empty(partitions)) {
+      if (!firstMessageReceived || inFlightRecords.empty(partitions)) {
         log.debug(s"Partitions drained ${partitions.mkString(",")}")
         ack.getOrElse(sender).tell(msg, sourceActor.ref)
       } else {
-        log.debug(s"Draining partitions {}", partitions)
+        log.debug(s"Draining partitions {}, inFlightRecords: {}", partitions, inFlightRecords)
         materializer.scheduleOnce(
           consumerSettings.drainingCheckInterval,
           new Runnable {
@@ -138,15 +139,27 @@ private[internal] abstract class TransactionalSourceLogic[K, V, Msg](shape: Sour
 
   override val groupId: String = consumerSettings.properties(ConsumerConfig.GROUP_ID_CONFIG)
 
+  private val onTransactionAbortedCb = getAsyncCallback[Unit] { _ =>
+    log.debug("Committing failed resetting inFlightRecords: {}", inFlightRecords)
+    inFlightRecords.reset()
+  }
+
+  private val onFirstMessageReceivedCb = getAsyncCallback[Unit] { _ =>
+    log.debug("First message received by producer")
+    firstMessageReceived = true
+  }
+
   override lazy val committedMarker: CommittedMarker = {
     val ec = materializer.executionContext
-    CommittedMarkerRef(sourceActor.ref, consumerSettings.commitTimeout)(ec)
+    CommittedMarkerRef(sourceActor.ref, consumerSettings.commitTimeout, onTransactionAborted, onFirstMessageReceived)(
+      ec
+    )
   }
 
   override def onMessage(rec: ConsumerRecord[K, V]): Unit =
     inFlightRecords.add(Map(new TopicPartition(rec.topic(), rec.partition()) -> rec.offset()))
 
-  override protected def stopConsumerActor(): Unit =
+  override protected def stopConsumerActor(): Unit = {
     sourceActor.ref
       .tell(Drain(
               inFlightRecords.assigned(),
@@ -154,6 +167,7 @@ private[internal] abstract class TransactionalSourceLogic[K, V, Msg](shape: Sour
               KafkaConsumerActor.Internal.StopFromStage(id)
             ),
             sourceActor.ref)
+  }
 
   override protected def addToPartitionAssignmentHandler(
       handler: PartitionAssignmentHandler
@@ -264,12 +278,17 @@ private[kafka] final class TransactionalSubSource[K, V](
         new PartitionAssignmentHelpers.Chain(handler, blockingRevokedCall)
       }
 
+      // NOTE: this is called by Consumer.poll thread from blocking partition rebalance handler
       private def waitForDraining(partitions: Set[TopicPartition]): Boolean = {
         import akka.pattern.ask
         implicit val timeout = Timeout(txConsumerSettings.commitTimeout)
         try {
           val drainCommandFutures =
-            subSources.values.map(_.stageActor).map(ask(_, Drain(partitions, None, Drained)))
+            subSources.values
+            // it's possible the sub source stage has already completed
+              .filterNot(_.stageActor.isTerminated)
+              .map(_.stageActor)
+              .map(ask(_, Drain(partitions, None, Drained)))
           implicit val ec = executionContext
           Await.result(Future.sequence(drainCommandFutures), timeout.duration)
           true
@@ -284,7 +303,7 @@ private[kafka] final class TransactionalSubSource[K, V](
 
 /** Internal API */
 @InternalApi
-private object TransactionalSourceLogic {
+private[internal] object TransactionalSourceLogic {
   type Offset = Long
 
   case object Drained
@@ -292,9 +311,11 @@ private object TransactionalSourceLogic {
                             drainedConfirmationRef: Option[ActorRef],
                             drainedConfirmationMsg: T)
   final case class Committed(offsets: Map[TopicPartition, OffsetAndMetadata])
-  case object CommittingFailure
 
-  private[internal] final case class CommittedMarkerRef(sourceActor: ActorRef, commitTimeout: FiniteDuration)(
+  private[internal] final case class CommittedMarkerRef(sourceActor: ActorRef,
+                                                        commitTimeout: FiniteDuration,
+                                                        onTransactionAborted: Promise[Unit],
+                                                        onFirstMessageReceived: Promise[Unit])(
       implicit ec: ExecutionContext
   ) extends CommittedMarker {
     override def committed(offsets: Map[TopicPartition, OffsetAndMetadata]): Future[Done] = {
@@ -303,9 +324,6 @@ private object TransactionalSourceLogic {
         .ask(Committed(offsets))(Timeout(commitTimeout))
         .map(_ => Done)
     }
-
-    override def failed(): Unit =
-      sourceActor ! CommittingFailure
   }
 
   private[internal] trait InFlightRecords {
@@ -330,11 +348,12 @@ private object TransactionalSourceLogic {
       override def add(offsets: Map[TopicPartition, Offset]): Unit =
         inFlightRecords = inFlightRecords ++ offsets
 
-      override def committed(committed: Map[TopicPartition, Offset]): Unit =
+      override def committed(committed: Map[TopicPartition, Offset]): Unit = {
         inFlightRecords = inFlightRecords.flatMap {
           case (tp, offset) if committed.get(tp).contains(offset) => None
           case x => Some(x)
         }
+      }
 
       override def revoke(revokedTps: Set[TopicPartition]): Unit =
         inFlightRecords = inFlightRecords -- revokedTps
@@ -370,6 +389,7 @@ private final class TransactionalSubSourceStageLogic[K, V](
   import TransactionalSourceLogic._
 
   private val inFlightRecords = InFlightRecords.empty
+  private var firstMessageReceived = false
 
   override def groupId: String = consumerSettings.properties(ConsumerConfig.GROUP_ID_CONFIG)
 
@@ -377,6 +397,11 @@ private final class TransactionalSubSourceStageLogic[K, V](
     inFlightRecords.add(Map(new TopicPartition(rec.topic(), rec.partition()) -> rec.offset()))
 
   override val fromPartitionedSource: Boolean = true
+
+  override def preStart(): Unit = {
+    super.preStart()
+    initSourceStageCallbacks(onFirstMessageReceivedCb, onTransactionAbortedCb)(materializer.executionContext)
+  }
 
   override protected def messageHandling: PartialFunction[(ActorRef, Any), Unit] =
     super.messageHandling.orElse(drainHandling).orElse {
@@ -412,12 +437,8 @@ private final class TransactionalSubSourceStageLogic[K, V](
     case (sender, Committed(offsets)) =>
       inFlightRecords.committed(offsets.view.mapValues(_.offset() - 1).toMap)
       sender ! Done
-    case (sender, CommittingFailure) => {
-      log.info("Committing failed, resetting in flight offsets")
-      inFlightRecords.reset()
-    }
     case (sender, Drain(partitions, ack, msg)) =>
-      if (inFlightRecords.empty(partitions)) {
+      if (!firstMessageReceived || inFlightRecords.empty(partitions)) {
         log.debug(s"Partitions drained ${partitions.mkString(",")}")
         ack.getOrElse(sender) ! msg
       } else {
@@ -431,12 +452,26 @@ private final class TransactionalSubSourceStageLogic[K, V](
         )
       }
     case (sender, DrainingComplete) =>
+      log.debug("Completing, StageActor {}", stageActor.ref)
       completeStage()
   }
 
-  lazy val committedMarker: CommittedMarker = {
+  private val onTransactionAbortedCb = getAsyncCallback[Unit] { _ =>
+    log.info("Committing failed, resetting inFlightRecords")
+    inFlightRecords.reset()
+  }
+
+  private val onFirstMessageReceivedCb = getAsyncCallback[Unit] { _ =>
+    log.info("First message received by producer")
+    firstMessageReceived = true
+  }
+
+  override lazy val committedMarker: CommittedMarker = {
     val ec = materializer.executionContext
-    CommittedMarkerRef(subSourceActor.ref, consumerSettings.commitTimeout)(ec)
+    CommittedMarkerRef(subSourceActor.ref,
+                       consumerSettings.commitTimeout,
+                       onTransactionAborted,
+                       onFirstMessageReceived)(ec)
   }
 }
 

@@ -35,6 +35,13 @@ class TransactionsSourceSpec
     with TransactionsOps
     with Repeated {
 
+  // It's possible to get into a livelock situation where the `restartAfter` interval causes transactions to abort
+  // over and over.  This can happen when there are a few partitions left to process and they can never be fully
+  // processed because we always restart the stream before the transaction can be completed successfully.
+  // The `maxRestarts` provides an upper bound for the maximum number of times we restart the stream so if we get
+  // into a livelock it can eventually be resolved by not restarting any more.
+  val maxRestarts = new AtomicInteger(1000)
+
   override implicit val patienceConfig: PatienceConfig = PatienceConfig(45.seconds, 1.second)
 
   override val testcontainersSettings = KafkaTestkitTestcontainersSettings(system)
@@ -57,9 +64,12 @@ class TransactionsSourceSpec
 
       val partitionSize = elements / sourcePartitions
       val producers: immutable.Seq[Future[Done]] =
-        (0 until sourcePartitions).map(
-          part => produce(sourceTopic, ((part * partitionSize) + 1) to (partitionSize * (part + 1)), part)
-        )
+        (0 until sourcePartitions).map { part =>
+          val rangeStart = ((part * partitionSize) + 1)
+          val rangeEnd = (partitionSize * (part + 1))
+          log.info(s"Producing [$rangeStart to $rangeEnd] to partition $part")
+          produce(sourceTopic, rangeStart to rangeEnd, part)
+        }
 
       Await.result(Future.sequence(producers), 1.minute)
 
@@ -79,7 +89,8 @@ class TransactionsSourceSpec
                                       sinkTopic,
                                       transactionId,
                                       10.seconds,
-                                      Some(restartAfter))
+                                      Some(restartAfter),
+                                      Some(maxRestarts))
                 .recover {
                   case e: TimeoutException =>
                     if (completedWithTimeout.incrementAndGet() > 10)
@@ -109,7 +120,6 @@ class TransactionsSourceSpec
 
       val consumer = offsetValueSource(probeConsumerSettings(probeConsumerGroup), sinkTopic)
         .take(elements.toLong)
-        .idleTimeout(30.seconds)
         .alsoTo(
           Flow[(Long, String)]
             .scan(0) { case (count, _) => count + 1 }

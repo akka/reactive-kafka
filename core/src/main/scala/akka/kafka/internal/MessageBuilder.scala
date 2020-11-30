@@ -16,14 +16,16 @@ import akka.kafka.ConsumerMessage.{
   TransactionalMessage,
   _
 }
+import akka.stream.stage.{AsyncCallback, GraphStageLogic}
 import org.apache.kafka.clients.consumer.{ConsumerRecord, OffsetAndMetadata}
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.requests.OffsetFetchResponse
 
 import scala.collection.compat._
 import scala.compat.java8.FutureConverters.FutureOps
-import scala.concurrent.Future
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.jdk.CollectionConverters._
+import scala.util.{Failure, Success}
 
 /** Internal API */
 @InternalApi
@@ -47,6 +49,21 @@ private[kafka] trait TransactionalMessageBuilderBase[K, V, Msg] extends MessageB
   def onMessage(consumerMessage: ConsumerRecord[K, V]): Unit
 
   def fromPartitionedSource: Boolean
+
+  val onTransactionAborted: Promise[Unit] = Promise()
+  val onFirstMessageReceived: Promise[Unit] = Promise()
+
+  def initSourceStageCallbacks(firstMessageReceivedCb: AsyncCallback[Unit],
+                               transactionAbortedCb: AsyncCallback[Unit])(implicit ec: ExecutionContext): Unit = {
+    onFirstMessageReceived.future.onComplete {
+      case Success(_) => firstMessageReceivedCb.invoke(())
+      case Failure(ex) => throw new RuntimeException("The first message was not received", ex)
+    }
+    onTransactionAborted.future.onComplete {
+      case Success(_) => transactionAbortedCb.invoke(())
+      case Failure(ex) => throw new RuntimeException("An error occurred while during the transaction abort process", ex)
+    }
+  }
 }
 
 /** Internal API */
@@ -155,8 +172,12 @@ private[kafka] trait CommittedMarker {
   /** Marks offsets as already committed */
   def committed(offsets: Map[TopicPartition, OffsetAndMetadata]): Future[Done]
 
-  /** Marks committing failure */
-  def failed(): Unit
+  /** Marks commit aborted */
+  def onTransactionAborted: Promise[Unit]
+
+  /** Marks first message enlisted in transaction */
+  def onFirstMessageReceived: Promise[Unit]
+
 }
 
 /** Internal API */

@@ -36,6 +36,12 @@ class TransactionsPartitionedSourceSpec
     with Repeated {
 
   val replicationFactor = 2
+  // It's possible to get into a livelock situation where the `restartAfter` interval causes transactions to abort
+  // over and over.  This can happen when there are a few partitions left to process and they can never be fully
+  // processed because we always restart the stream before the transaction can be completed successfully.
+  // The `maxRestarts` provides an upper bound for the maximum number of times we restart the stream so if we get
+  // into a livelock it can eventually be resolved by not restarting any more.
+  val maxRestarts = new AtomicInteger(1000)
 
   override implicit val patienceConfig: PatienceConfig = PatienceConfig(45.seconds, 1.second)
 
@@ -82,7 +88,8 @@ class TransactionsPartitionedSourceSpec
                 transactionalId,
                 idleTimeout = 10.seconds,
                 maxPartitions = sourcePartitions,
-                restartAfter = Some(restartAfter)
+                restartAfter = Some(restartAfter),
+                maxRestarts = Some(maxRestarts)
               ).recover {
                 case e: TimeoutException =>
                   if (completedWithTimeout.incrementAndGet() > 10)
