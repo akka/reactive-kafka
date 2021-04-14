@@ -9,7 +9,7 @@ import akka.actor.{ActorRef, ExtendedActorSystem, Terminated}
 import akka.annotation.InternalApi
 import akka.kafka.scaladsl.PartitionAssignmentHandler
 import akka.kafka.{ConsumerSettings, RestrictedConsumer, Subscription}
-import akka.stream.{ActorMaterializerHelper, SourceShape}
+import akka.stream.{ActorMaterializerHelper, SourceShape, SubscriptionWithCancelException}
 import org.apache.kafka.common.TopicPartition
 
 import scala.concurrent.{Future, Promise}
@@ -45,14 +45,14 @@ import scala.concurrent.{Future, Promise}
     super.postStop()
   }
 
-  final override def performShutdown(): Unit = {
-    super.performShutdown()
+  final override def performShutdown(cause: Throwable): Unit = {
+    super.performShutdown(cause)
     setKeepGoing(true)
     if (!isClosed(shape.out)) {
       complete(shape.out)
     }
     sourceActor.become(shuttingDownReceive)
-    stopConsumerActor()
+    stopConsumerActor(cause)
   }
 
   protected def shuttingDownReceive: PartialFunction[(ActorRef, Any), Unit] = {
@@ -61,11 +61,17 @@ import scala.concurrent.{Future, Promise}
       completeStage()
   }
 
-  protected def stopConsumerActor(): Unit =
-    materializer.scheduleOnce(settings.stopTimeout, new Runnable {
-      override def run(): Unit =
-        consumerActor.tell(KafkaConsumerActor.Internal.StopFromStage(id), sourceActor.ref)
-    })
+  protected def stopConsumerActor(cause: Throwable): Unit = {
+    def performImmediateShutdown(): Unit =
+      consumerActor.tell(KafkaConsumerActor.Internal.StopFromStage(id), sourceActor.ref)
+
+    if (cause.isInstanceOf[SubscriptionWithCancelException.NonFailureCancellation])
+      materializer.scheduleOnce(
+        settings.stopTimeout,
+        () => performImmediateShutdown()
+      )
+    else performImmediateShutdown()
+  }
 
   /**
    * Opportunity for subclasses to add a different logic to the partition assignment callbacks.

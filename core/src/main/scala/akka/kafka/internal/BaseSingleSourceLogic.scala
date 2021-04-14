@@ -110,8 +110,8 @@ import scala.concurrent.{ExecutionContext, Future}
 
   setHandler(shape.out, new OutHandler {
     override def onPull(): Unit = pump()
-    override def onDownstreamFinish(): Unit =
-      performShutdown()
+    override def onDownstreamFinish(cause: Throwable): Unit =
+      performShutdown(cause)
   })
 
   override def postStop(): Unit = {
@@ -119,6 +119,6 @@ import scala.concurrent.{ExecutionContext, Future}
     super.postStop()
   }
 
-  def performShutdown(): Unit =
+  def performShutdown(cause: Throwable): Unit =
     log.info("Completing")
 }

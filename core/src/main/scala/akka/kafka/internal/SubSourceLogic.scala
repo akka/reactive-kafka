@@ -18,7 +18,7 @@ import akka.pattern.{ask, AskTimeoutException}
 import akka.stream.scaladsl.Source
 import akka.stream.stage.GraphStageLogic.StageActor
 import akka.stream.stage._
-import akka.stream.{ActorMaterializerHelper, Attributes, Outlet, SourceShape}
+import akka.stream.{Attributes, Outlet, SourceShape, SubscriptionWithCancelException}
 import akka.util.Timeout
 import org.apache.kafka.common.TopicPartition
 
@@ -85,7 +85,7 @@ private class SubSourceLogic[K, V, Msg](
         failStage(new ConsumerFailed)
     }
     consumerActor = {
-      val extendedActorSystem = ActorMaterializerHelper.downcast(materializer).system.asInstanceOf[ExtendedActorSystem]
+      val extendedActorSystem = materializer.system.asInstanceOf[ExtendedActorSystem]
       extendedActorSystem.systemActorOf(akka.kafka.KafkaConsumerActor.props(sourceActor.ref, settings),
                                         s"kafka-consumer-$actorNumber")
     }
@@ -216,7 +216,7 @@ private class SubSourceLogic[K, V, Msg](
     new OutHandler {
       override def onPull(): Unit =
         emitSubSourcesForPendingPartitions()
-      override def onDownstreamFinish(): Unit = performShutdown()
+      override def onDownstreamFinish(cause: Throwable): Unit = performShutdown(cause)
     }
   )
 
@@ -259,7 +259,7 @@ private class SubSourceLogic[K, V, Msg](
     onStop()
   }
 
-  override def performShutdown(): Unit = {
+  override def performShutdown(cause: Throwable): Unit = {
     log.info("Completing. Partitions [{}], StageActor {}", subSources.keys.mkString(","), sourceActor.ref)
     setKeepGoing(true)
     //todo we should wait for subsources to be shutdown and next shutdown main stage
@@ -274,13 +274,19 @@ private class SubSourceLogic[K, V, Msg](
         onShutdown()
         completeStage()
     }
-    materializer.scheduleOnce(
-      settings.stopTimeout,
-      new Runnable {
-        override def run(): Unit =
-          consumerActor.tell(KafkaConsumerActor.Internal.StopFromStage(id), sourceActor.ref)
-      }
-    )
+    stopConsumerActor(cause)
+  }
+
+  private def stopConsumerActor(cause: Throwable): Unit = {
+    def performImmediateShutdown(): Unit =
+      consumerActor.tell(KafkaConsumerActor.Internal.StopFromStage(id), sourceActor.ref)
+
+    if (cause.isInstanceOf[SubscriptionWithCancelException.NonFailureCancellation])
+      materializer.scheduleOnce(
+        settings.stopTimeout,
+        () => performImmediateShutdown()
+      )
+    else performImmediateShutdown()
   }
 
   /**
@@ -446,14 +452,14 @@ private abstract class SubSourceStageLogic[K, V, Msg](
     shape.out,
     new OutHandler {
       override def onPull(): Unit = pump()
-      override def onDownstreamFinish(): Unit = {
+      override def onDownstreamFinish(cause: Throwable): Unit = {
         subSourceCancelledCb.invoke(tp -> onDownstreamFinishSubSourceCancellationStrategy())
-        super.onDownstreamFinish()
+        super.onDownstreamFinish(cause)
       }
     }
   )
 
-  def performShutdown() = {
+  def performShutdown(cause: Throwable) = {
     log.info("Completing. Partition {}", tp)
     completeStage()
   }
